@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=PitStop
 Comment=Manage car parts, vehicles, and service records
-Exec=/usr/bin/pitstop
+Exec=pitstop
 Type=Application
 Terminal=false
 Categories=Utility;Office;

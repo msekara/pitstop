@@ -1,6 +1,6 @@
 Name:           pitstop
 Version:        1.0.0
-Release:        1%{?dist}
+Release:        3%{?dist}
 Summary:        Car Parts and Service Management Application
 License:        MIT
 Group:          Applications/Productivity
@@ -31,23 +31,27 @@ cp %{SOURCE3} .
 # No build step required for Python script
 
 %install
-mkdir -p %{buildroot}%{_datadir}/pitstop
-mkdir -p %{buildroot}%{_datadir}/applications
 mkdir -p %{buildroot}%{_bindir}
+mkdir -p %{buildroot}%{_datadir}/pitstop
+mkdir -p %{buildroot}%{_localstatedir}/lib/pitstop
+mkdir -p %{buildroot}%{_datadir}/applications
+
 install -m 644 pitstop.py %{buildroot}%{_datadir}/pitstop/pitstop.py
 install -m 755 pitstop %{buildroot}%{_bindir}/pitstop
 install -m 644 pitstop.desktop %{buildroot}%{_datadir}/applications/pitstop.desktop
-install -m 644 README.md %{buildroot}%{_datadir}/pitstop/README.md
+
+# Validate desktop file
+desktop-file-validate %{buildroot}%{_datadir}/applications/pitstop.desktop
 
 %files
-%{_datadir}/pitstop/pitstop.py
 %{_bindir}/pitstop
+%{_datadir}/pitstop/pitstop.py
 %{_datadir}/applications/pitstop.desktop
-%{_datadir}/pitstop/README.md
 %doc README.md
 
 %post
-# Update desktop database for .desktop file
+
+# Update desktop database
 update-desktop-database &>/dev/null || :
 
 %postun
@@ -55,5 +59,9 @@ update-desktop-database &>/dev/null || :
 update-desktop-database &>/dev/null || :
 
 %changelog
+* Sun Aug 24 2025 Mladen Sekara <mladen.sekara@msprimes.com> - 1.0.0-3
+- Moved database to user homedir
+* Sun Aug 24 2025 Mladen Sekara <mladen.sekara@msprimes.com> - 1.0.0-2
+- Minor bug fixes and upgrade to handle same part numbers across multiple vehicles
 * Sat Aug 23 2025 Mladen Sekara <mladen.sekara@msprimes.com> - 1.0.0-1
 - Initial package release
