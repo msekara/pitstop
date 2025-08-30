@@ -8,6 +8,9 @@ import csv
 from tkinter import filedialog
 import uuid
 import os
+import shutil
+from tkinter import Text, END
+import time
 
 class CarManagementApp:
     def __init__(self, root):
@@ -55,12 +58,30 @@ class CarManagementApp:
             'service_types': {'column': None, 'reverse': False}
         }
 
+        self.vehicle_filter_id = None
+        self._last_select_time = 0
+        self._debounce_interval = 0.2  # 200ms debounce interval
+        self.id_to_display_map = {}
+
         # Initialize tabs
         self.setup_parts_tab()
         self.setup_vehicles_tab()
         self.setup_services_tab()
         self.setup_service_types_tab()
         self.setup_about_tab()
+
+        self.current_tab = self.notebook.select()
+        self.notebook.bind('<<NotebookTabChanged>>', self.on_tab_change)
+
+    def on_tab_change(self, event):
+        new_tab = self.notebook.select()
+        parts_tab_str = str(self.parts_tab)
+        if self.current_tab == parts_tab_str and new_tab != parts_tab_str:
+            self.vehicle_filter_id = None
+            self.parts_search_entry.delete(0, END)
+        if new_tab == parts_tab_str:
+            self.refresh_parts()
+        self.current_tab = new_tab
 
     def setup_about_tab(self):
         about_container = ttk.Frame(self.about_tab, padding=20)
@@ -96,7 +117,7 @@ class CarManagementApp:
                     manufacturer TEXT,
                     part_number TEXT NOT NULL,
                     description TEXT,
-                    price INTEGER,
+                    price INTEGER DEFAULT 0,
                     vehicle_id INTEGER NOT NULL,
                     FOREIGN KEY (vehicle_id) REFERENCES vehicles(id),
                     UNIQUE (part_number, vehicle_id)
@@ -105,7 +126,7 @@ class CarManagementApp:
             # Copy data
             cursor.execute('''
                 INSERT INTO parts_temp (id, name, manufacturer, part_number, description, price, vehicle_id)
-                SELECT id, name, manufacturer, part_number, description, price, vehicle_id
+                SELECT id, name, manufacturer, part_number, description, COALESCE(price, 0), vehicle_id
                 FROM parts
             ''')
             cursor.execute('DROP TABLE parts')
@@ -135,6 +156,48 @@ class CarManagementApp:
             cursor.execute('DROP TABLE alt_parts')
             cursor.execute('ALTER TABLE alt_parts_temp RENAME TO alt_parts')
 
+        # Migrate services to remove service_type_id and use junction
+        cursor.execute("PRAGMA table_info(services)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'service_type_id' in columns:
+            # Create junction table
+            cursor.execute('''
+                CREATE TABLE service_service_types (
+                    service_id INTEGER,
+                    service_type_id INTEGER,
+                    PRIMARY KEY (service_id, service_type_id),
+                    FOREIGN KEY (service_id) REFERENCES services(id),
+                    FOREIGN KEY (service_type_id) REFERENCES service_types(id)
+                )
+            ''')
+            # Insert existing data
+            cursor.execute('''
+                INSERT INTO service_service_types (service_id, service_type_id)
+                SELECT id, service_type_id FROM services WHERE service_type_id IS NOT NULL
+            ''')
+            # Create temp services without service_type_id
+            cursor.execute('''
+                CREATE TABLE services_temp (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vehicle_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    odometer INTEGER,
+                    description TEXT,
+                    cost INTEGER DEFAULT 0,
+                    service_interval_miles INTEGER,
+                    service_interval_days INTEGER,
+                    FOREIGN KEY (vehicle_id) REFERENCES vehicles(id)
+                )
+            ''')
+            # Copy data
+            cursor.execute('''
+                INSERT INTO services_temp (id, vehicle_id, date, odometer, description, cost, service_interval_miles, service_interval_days)
+                SELECT id, vehicle_id, date, odometer, description, COALESCE(cost, 0), service_interval_miles, service_interval_days
+                FROM services
+            ''')
+            cursor.execute('DROP TABLE services')
+            cursor.execute('ALTER TABLE services_temp RENAME TO services')
+
         self.conn.commit()
 
     def create_tables(self):
@@ -146,7 +209,7 @@ class CarManagementApp:
                 manufacturer TEXT,
                 part_number TEXT NOT NULL,
                 description TEXT,
-                price INTEGER,
+                price INTEGER DEFAULT 0,
                 vehicle_id INTEGER NOT NULL,
                 FOREIGN KEY (vehicle_id) REFERENCES vehicles(id),
                 UNIQUE (part_number, vehicle_id)
@@ -180,14 +243,21 @@ class CarManagementApp:
             CREATE TABLE IF NOT EXISTS services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 vehicle_id INTEGER NOT NULL,
-                service_type_id INTEGER,
                 date TEXT NOT NULL,
                 odometer INTEGER,
                 description TEXT,
-                cost INTEGER,
+                cost INTEGER DEFAULT 0,
                 service_interval_miles INTEGER,
                 service_interval_days INTEGER,
-                FOREIGN KEY (vehicle_id) REFERENCES vehicles(id),
+                FOREIGN KEY (vehicle_id) REFERENCES vehicles(id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS service_service_types (
+                service_id INTEGER,
+                service_type_id INTEGER,
+                PRIMARY KEY (service_id, service_type_id),
+                FOREIGN KEY (service_id) REFERENCES services(id),
                 FOREIGN KEY (service_type_id) REFERENCES service_types(id)
             )
         ''')
@@ -288,6 +358,7 @@ class CarManagementApp:
         self.parts_search_entry.pack(side='left', fill='x', expand=True, padx=5)
         self.parts_search_entry.bind('<KeyRelease>', self.filter_parts)
 
+        ttk.Button(search_frame, text='Show All', command=self.show_all_parts, bootstyle=INFO).pack(side='right', padx=5)
         ttk.Button(search_frame, text='Export to CSV', command=self.export_parts, bootstyle=INFO).pack(side='right', padx=5)
 
         tree_frame = ttk.LabelFrame(self.parts_container, text='Parts Inventory', bootstyle=INFO, padding=10)
@@ -335,7 +406,7 @@ class CarManagementApp:
         self.part_number_entry.pack(fill='x', pady=2)
 
         ttk.Label(form_frame, text='Description:', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.part_description_entry = ttk.Entry(form_frame, bootstyle=SECONDARY)
+        self.part_description_entry = Text(form_frame, height=3, width=30)
         self.part_description_entry.pack(fill='x', pady=2)
 
         ttk.Label(form_frame, text='Price ($):', font=('Helvetica', 10)).pack(anchor='w', pady=2)
@@ -370,25 +441,64 @@ class CarManagementApp:
         add_alt_frame.pack(fill='x', pady=5)
 
         ttk.Label(add_alt_frame, text='Manufacturer:', font=('Helvetica', 10)).pack(side='left', padx=5)
-        self.alt_manufacturer_entry = ttk.Entry(add_alt_frame, bootstyle=SECONDARY, width=15)
+        self.alt_manufacturer_entry = ttk.Entry(alt_parts_frame, bootstyle=SECONDARY, width=15)
         self.alt_manufacturer_entry.pack(side='left', padx=5)
 
         ttk.Label(add_alt_frame, text='Part Number:', font=('Helvetica', 10)).pack(side='left', padx=5)
-        self.alt_part_number_entry = ttk.Entry(add_alt_frame, bootstyle=SECONDARY, width=15)
+        self.alt_part_number_entry = ttk.Entry(alt_parts_frame, bootstyle=SECONDARY, width=15)
         self.alt_part_number_entry.pack(side='left', padx=5)
 
         ttk.Button(add_alt_frame, text='Add Alt', command=self.add_alt_part, bootstyle=SUCCESS).pack(side='left', padx=5)
         ttk.Button(add_alt_frame, text='Remove Alt', command=self.remove_alt_part, bootstyle=DANGER).pack(side='left', padx=5)
 
-        self.load_parts()
+        self.refresh_parts()
         self.parts_tree.bind('<<TreeviewSelect>>', self.select_part)
 
     def filter_parts(self, event):
+        self.refresh_parts()
+
+    def show_all_parts(self):
+        self.vehicle_filter_id = None
+        self.parts_search_entry.delete(0, END)
+        self.refresh_parts()
+
+    def refresh_parts(self):
         search_term = self.parts_search_entry.get().lower()
+        if search_term:
+            self.filter_parts_with_search(search_term)
+        else:
+            self.load_parts_filtered()
+
+    def load_parts_filtered(self):
         for item in self.parts_tree.get_children():
             self.parts_tree.delete(item)
         cursor = self.conn.cursor()
-        cursor.execute('''
+        query = '''
+            SELECT p.id, p.name, p.manufacturer, p.part_number, p.description, p.price,
+                   COALESCE(v.name || (CASE WHEN v.year IS NOT NULL AND v.model IS NOT NULL THEN ' (' || v.year || ' ' || v.model || ')' ELSE '' END), 'N/A')
+            FROM parts p
+            LEFT JOIN vehicles v ON p.vehicle_id = v.id
+        '''
+        params = []
+        if self.vehicle_filter_id is not None:
+            query += ' WHERE p.vehicle_id = ?'
+            params.append(self.vehicle_filter_id)
+        query += ' ORDER BY p.id ASC'
+        cursor.execute(query, params)
+        for row in cursor.fetchall():
+            values = tuple('' if x is None else x for x in row)
+            part_id = values[0]
+            main_item = self.parts_tree.insert('', 'end', iid=part_id, values=values)
+            cursor.execute('SELECT alt_id, manufacturer, part_number FROM alt_parts WHERE part_id = ? ORDER BY alt_id ASC', (part_id,))
+            for alt_row in cursor.fetchall():
+                self.parts_tree.insert(main_item, 'end', values=(alt_row[0], '', alt_row[1], alt_row[2], '', '', values[6]), tags=('alt_part',))
+            self.parts_tree.item(main_item, open=True)
+
+    def filter_parts_with_search(self, search_term):
+        for item in self.parts_tree.get_children():
+            self.parts_tree.delete(item)
+        cursor = self.conn.cursor()
+        query = '''
             SELECT DISTINCT p.id, p.name, p.manufacturer, p.part_number, p.description, p.price,
                    COALESCE(v.name || (CASE WHEN v.year IS NOT NULL AND v.model IS NOT NULL THEN ' (' || v.year || ' ' || v.model || ')' ELSE '' END), 'N/A')
             FROM parts p
@@ -397,39 +507,28 @@ class CarManagementApp:
             WHERE lower(p.name) LIKE ? OR lower(p.part_number) LIKE ?
             OR lower(ap.manufacturer) LIKE ? OR lower(ap.part_number) LIKE ?
             OR lower(v.name) LIKE ? OR lower(v.model) LIKE ?
-            ORDER BY p.id ASC
-        ''', (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%', f'%{search_term}%'))
+        '''
+        params = [f'%{search_term}%'] * 6
+        if self.vehicle_filter_id is not None:
+            query += ' AND p.vehicle_id = ?'
+            params.append(self.vehicle_filter_id)
+        query += ' ORDER BY p.id ASC'
+        cursor.execute(query, params)
         for row in cursor.fetchall():
-            part_id = row[0]
-            main_item = self.parts_tree.insert('', 'end', iid=part_id, values=row)
+            values = tuple('' if x is None else x for x in row)
+            part_id = values[0]
+            main_item = self.parts_tree.insert('', 'end', iid=part_id, values=values)
             cursor.execute('SELECT alt_id, manufacturer, part_number FROM alt_parts WHERE part_id = ? ORDER BY alt_id ASC', (part_id,))
             for alt_row in cursor.fetchall():
-                self.parts_tree.insert(main_item, 'end', values=(alt_row[0], '', alt_row[1], alt_row[2], '', '', row[6]), tags=('alt_part',))
-
-    def load_parts(self):
-        for item in self.parts_tree.get_children():
-            self.parts_tree.delete(item)
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT p.id, p.name, p.manufacturer, p.part_number, p.description, p.price,
-                   COALESCE(v.name || (CASE WHEN v.year IS NOT NULL AND v.model IS NOT NULL THEN ' (' || v.year || ' ' || v.model || ')' ELSE '' END), 'N/A')
-            FROM parts p
-            LEFT JOIN vehicles v ON p.vehicle_id = v.id
-            ORDER BY p.id ASC
-        ''')
-        for row in cursor.fetchall():
-            part_id = row[0]
-            main_item = self.parts_tree.insert('', 'end', iid=part_id, values=row)
-            cursor.execute('SELECT alt_id, manufacturer, part_number FROM alt_parts WHERE part_id = ? ORDER BY alt_id ASC', (part_id,))
-            for alt_row in cursor.fetchall():
-                self.parts_tree.insert(main_item, 'end', values=(alt_row[0], '', alt_row[1], alt_row[2], '', '', row[6]), tags=('alt_part',))
+                self.parts_tree.insert(main_item, 'end', values=(alt_row[0], '', alt_row[1], alt_row[2], '', '', values[6]), tags=('alt_part',))
+            self.parts_tree.item(main_item, open=True)
 
     def add_part(self):
         name = self.part_name_entry.get()
         manufacturer = self.part_manufacturer_entry.get()
         part_number = self.part_number_entry.get()
-        description = self.part_description_entry.get()
-        price = self.part_price_entry.get()
+        description = self.part_description_entry.get('1.0', END).strip()
+        price = self.part_price_entry.get().strip()
         vehicle_selection = self.part_vehicle_combo.get()
         vehicle_id = self.vehicle_id_map.get(vehicle_selection) if vehicle_selection else None
         if not name:
@@ -441,7 +540,7 @@ class CarManagementApp:
         if not part_number:
             messagebox.showerror('Error', 'Part number is required')
             return
-        price_value = None
+        price_value = 0
         if price:
             try:
                 price_value = int(price)
@@ -453,41 +552,77 @@ class CarManagementApp:
             cursor.execute('INSERT INTO parts (name, manufacturer, part_number, description, price, vehicle_id) VALUES (?, ?, ?, ?, ?, ?)',
                            (name, manufacturer, part_number, description or None, price_value, vehicle_id))
             self.conn.commit()
-            self.load_parts()
+            self.refresh_parts()
             self.clear_part_entries()
         except sqlite3.IntegrityError:
             messagebox.showerror('Error', 'Part number already exists for this vehicle. Please use a unique part number.')
             return
 
+    def _debounce(self):
+        current_time = time.time()
+        if current_time - self._last_select_time < self._debounce_interval:
+            return False
+        self._last_select_time = current_time
+        return True
+
     def select_part(self, event):
+        if not self._debounce():
+            return
+
         selected = self.parts_tree.focus()
-        if selected:
+        if not selected:
+            self.clear_part_entries()
+            return
+
+        self.parts_tree.bind('<<TreeviewSelect>>', None)
+
+        try:
             if self.parts_tree.parent(selected):
                 parent = self.parts_tree.parent(selected)
                 self.parts_tree.selection_set(parent)
                 selected = parent
+
             values = self.parts_tree.item(selected, 'values')
+            if not values:
+                self.clear_part_entries()
+                return
+
             self.part_name_entry.delete(0, ttk.END)
             self.part_name_entry.insert(0, values[1])
             self.part_manufacturer_entry.delete(0, ttk.END)
             self.part_manufacturer_entry.insert(0, values[2] if values[2] else '')
             self.part_number_entry.delete(0, ttk.END)
             self.part_number_entry.insert(0, values[3] if values[3] else '')
-            self.part_description_entry.delete(0, ttk.END)
-            self.part_description_entry.insert(0, values[4] if values[4] else '')
+            self.part_description_entry.delete('1.0', END)
+            self.part_description_entry.insert('1.0', values[4] if values[4] else '')
             self.part_price_entry.delete(0, ttk.END)
             self.part_price_entry.insert(0, values[5] if values[5] else '')
+
             cursor = self.conn.cursor()
             cursor.execute('SELECT vehicle_id FROM parts WHERE id = ?', (values[0],))
-            vehicle_id = cursor.fetchone()[0]
+            result = cursor.fetchone()
+            vehicle_id = result[0] if result else None
+
             if vehicle_id:
-                cursor.execute('SELECT name, year, model FROM vehicles WHERE id = ?', (vehicle_id,))
-                vehicle = cursor.fetchone()
-                vehicle_display = f"{vehicle_id} - {vehicle[0]}{f' ({vehicle[1]} {vehicle[2]})' if vehicle[1] and vehicle[2] else ''}"
+                vehicle_display = self.id_to_display_map.get(vehicle_id, '')
+                if not vehicle_display:
+                    cursor.execute('SELECT name, year, model FROM vehicles WHERE id = ?', (vehicle_id,))
+                    vehicle = cursor.fetchone()
+                    if vehicle:
+                        vehicle_display = f"{vehicle_id} - {vehicle[0]}{f' ({vehicle[1]} {vehicle[2]})' if vehicle[1] and vehicle[2] else ''}"
+                        self.id_to_display_map[vehicle_id] = vehicle_display
                 self.part_vehicle_combo.set(vehicle_display)
             else:
                 self.part_vehicle_combo.set('')
+
             self.load_alt_parts(selected)
+
+        except Exception as e:
+            print(f"Error in select_part: {e}")
+            self.clear_part_entries()
+
+        finally:
+            self.root.after(100, lambda: self.parts_tree.bind('<<TreeviewSelect>>', self.select_part))
 
     def update_part(self):
         selected = self.parts_tree.focus()
@@ -498,8 +633,8 @@ class CarManagementApp:
         name = self.part_name_entry.get()
         manufacturer = self.part_manufacturer_entry.get()
         part_number = self.part_number_entry.get()
-        description = self.part_description_entry.get()
-        price = self.part_price_entry.get()
+        description = self.part_description_entry.get('1.0', END).strip()
+        price = self.part_price_entry.get().strip()
         vehicle_selection = self.part_vehicle_combo.get()
         vehicle_id = self.vehicle_id_map.get(vehicle_selection) if vehicle_selection else None
         if not name:
@@ -511,7 +646,7 @@ class CarManagementApp:
         if not part_number:
             messagebox.showerror('Error', 'Part number is required')
             return
-        price_value = None
+        price_value = 0
         if price:
             try:
                 price_value = int(price)
@@ -527,7 +662,7 @@ class CarManagementApp:
         cursor.execute('UPDATE parts SET name=?, manufacturer=?, part_number=?, description=?, price=?, vehicle_id=? WHERE id=?',
                        (name, manufacturer, part_number, description or None, price_value, vehicle_id, id_))
         self.conn.commit()
-        self.load_parts()
+        self.refresh_parts()
         self.clear_part_entries()
 
     def delete_part(self):
@@ -541,14 +676,14 @@ class CarManagementApp:
         cursor.execute('DELETE FROM service_parts WHERE part_id=?', (id_,))
         cursor.execute('DELETE FROM alt_parts WHERE part_id=?', (id_,))
         self.conn.commit()
-        self.load_parts()
+        self.refresh_parts()
         self.clear_part_entries()
 
     def clear_part_entries(self):
         self.part_name_entry.delete(0, ttk.END)
         self.part_manufacturer_entry.delete(0, ttk.END)
         self.part_number_entry.delete(0, ttk.END)
-        self.part_description_entry.delete(0, ttk.END)
+        self.part_description_entry.delete('1.0', END)
         self.part_price_entry.delete(0, ttk.END)
         self.part_vehicle_combo.set('')
         self.alt_manufacturer_entry.delete(0, ttk.END)
@@ -600,7 +735,7 @@ class CarManagementApp:
                        (alt_id, part_id, manufacturer, part_number))
         self.conn.commit()
         self.load_alt_parts(part_id)
-        self.load_parts()
+        self.refresh_parts()
         self.alt_manufacturer_entry.delete(0, ttk.END)
         self.alt_part_number_entry.delete(0, ttk.END)
 
@@ -621,7 +756,7 @@ class CarManagementApp:
         part_id = self.parts_tree.focus()
         if part_id:
             self.load_alt_parts(part_id)
-            self.load_parts()
+            self.refresh_parts()
 
     def export_parts(self):
         file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
@@ -641,6 +776,53 @@ class CarManagementApp:
             for row in parts:
                 writer.writerow(row)
         messagebox.showinfo('Export Successful', 'Parts exported to CSV successfully')
+
+    def backup_database(self):
+        """Backup the entire database to a user-selected file."""
+        db_path = os.path.join(os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')), 'pitstop', 'pitstop.db')
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".db",
+            filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")],
+            title="Save Database Backup"
+        )
+        if not file_path:
+            return
+        try:
+            shutil.copy2(db_path, file_path)
+            messagebox.showinfo('Backup Successful', f'Database backed up to {file_path}')
+        except Exception as e:
+            messagebox.showerror('Backup Failed', f'Error during backup: {str(e)}')
+
+    def restore_database(self):
+        """Restore the database from a user-selected backup file."""
+        db_path = os.path.join(os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')), 'pitstop', 'pitstop.db')
+        file_path = filedialog.askopenfilename(
+            filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")],
+            title="Select Database Backup to Restore"
+        )
+        if not file_path:
+            return
+        try:
+            # Close the current connection
+            self.conn.close()
+            # Replace the current database with the backup
+            shutil.copy2(file_path, db_path)
+            # Reconnect to the database
+            self.conn = sqlite3.connect(db_path)
+            self.create_tables()  # Ensure table structure is intact
+            self.refresh_parts()
+            self.load_vehicles()
+            self.load_service_types()
+            self.load_services()
+            self.load_vehicle_combo()
+            self.load_service_types_checkboxes()
+            self.load_part_combo()
+            messagebox.showinfo('Restore Successful', f'Database restored from {file_path}')
+        except Exception as e:
+            messagebox.showerror('Restore Failed', f'Error during restore: {str(e)}')
+            # Reconnect to original database if restore fails
+            self.conn = sqlite3.connect(db_path)
+            self.create_tables()
 
     def setup_vehicles_tab(self):
         self.vehicles_container = ttk.Frame(self.vehicles_tab, padding=10)
@@ -691,6 +873,16 @@ class CarManagementApp:
 
         self.load_vehicles()
         self.vehicles_tree.bind('<<TreeviewSelect>>', self.select_vehicle)
+        self.vehicles_tree.bind('<Double-1>', self.filter_parts_by_vehicle)
+
+    def filter_parts_by_vehicle(self, event):
+        selected = self.vehicles_tree.focus()
+        if selected:
+            vehicle_id = self.vehicles_tree.item(selected, 'values')[0]
+            self.vehicle_filter_id = vehicle_id
+            self.parts_search_entry.delete(0, END)
+            self.notebook.select(self.parts_tab)
+            self.refresh_parts()
 
     def load_vehicles(self):
         for item in self.vehicles_tree.get_children():
@@ -698,7 +890,8 @@ class CarManagementApp:
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM vehicles ORDER BY id ASC')
         for row in cursor.fetchall():
-            self.vehicles_tree.insert('', 'end', values=row)
+            values = tuple('' if x is None else x for x in row)
+            self.vehicles_tree.insert('', 'end', values=values)
         self.load_vehicle_combo()
 
     def add_vehicle(self):
@@ -838,8 +1031,9 @@ class CarManagementApp:
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM service_types ORDER BY id ASC')
         for row in cursor.fetchall():
-            self.service_types_tree.insert('', 'end', values=row)
-        self.load_service_type_combo()
+            values = tuple('' if x is None else x for x in row)
+            self.service_types_tree.insert('', 'end', values=values)
+        self.load_service_types_checkboxes()
 
     def add_service_type(self):
         name = self.service_type_name_entry.get()
@@ -882,7 +1076,7 @@ class CarManagementApp:
             return
         id_ = self.service_types_tree.item(selected, 'values')[0]
         cursor = self.conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM services WHERE service_type_id=?', (id_,))
+        cursor.execute('SELECT COUNT(*) FROM service_service_types WHERE service_type_id=?', (id_,))
         if cursor.fetchone()[0] > 0:
             messagebox.showerror('Error', 'Cannot delete service type used in services')
             return
@@ -905,23 +1099,27 @@ class CarManagementApp:
         self.services_container = ttk.Frame(self.services_tab, padding=10)
         self.services_container.pack(fill='both', expand=True)
 
+        # Search frame
         search_frame = ttk.Frame(self.services_container, padding=5)
         search_frame.pack(fill='x', pady=5)
 
-        ttk.Label(search_frame, text='Search Services:', font=('Helvetica', 10)).pack(side='left', padx=5)
-        self.services_search_entry = ttk.Entry(search_frame, bootstyle=SECONDARY)
+        ttk.Label(search_frame, text='Search Services:', font=('Helvetica', 12)).pack(side='left', padx=5)
+        self.services_search_entry = ttk.Entry(search_frame, bootstyle=SECONDARY, font=('Helvetica', 12))
         self.services_search_entry.pack(side='left', fill='x', expand=True, padx=5)
         self.services_search_entry.bind('<KeyRelease>', self.filter_services)
 
+        ttk.Button(search_frame, text='Backup DB', command=self.backup_database, bootstyle=INFO).pack(side='right', padx=5)
+        ttk.Button(search_frame, text='Restore DB', command=self.restore_database, bootstyle=INFO).pack(side='right', padx=5)
         ttk.Button(search_frame, text='Export to CSV', command=self.export_services, bootstyle=INFO).pack(side='right', padx=5)
 
+        # Left frame for services tree
         tree_frame = ttk.LabelFrame(self.services_container, text='Service Records', bootstyle=INFO, padding=10)
         tree_frame.pack(side='left', fill='both', expand=True, padx=5)
 
-        self.services_tree = ttk.Treeview(tree_frame, columns=('ID', 'Vehicle', 'Type', 'Date', 'Odometer', 'Description', 'Cost', 'Interval Miles', 'Interval Days', 'Next Service'), show='headings', bootstyle='primary')
+        self.services_tree = ttk.Treeview(tree_frame, columns=('ID', 'Vehicle', 'Types', 'Date', 'Odometer', 'Description', 'Cost', 'Interval Miles', 'Interval Days', 'Next Service'), show='headings', bootstyle='primary')
         self.services_tree.heading('ID', text='ID', anchor='center')
         self.services_tree.heading('Vehicle', text='Vehicle', anchor='center')
-        self.services_tree.heading('Type', text='Service Type', anchor='center')
+        self.services_tree.heading('Types', text='Service Types', anchor='center')
         self.services_tree.heading('Date', text='Date', anchor='center')
         self.services_tree.heading('Odometer', text='Odometer', anchor='center')
         self.services_tree.heading('Description', text='Description', anchor='center')
@@ -931,7 +1129,7 @@ class CarManagementApp:
         self.services_tree.heading('Next Service', text='Next Service', anchor='center')
         self.services_tree.column('ID', width=60, anchor='center')
         self.services_tree.column('Vehicle', width=200, anchor='center')
-        self.services_tree.column('Type', width=150, anchor='center')
+        self.services_tree.column('Types', width=150, anchor='center')
         self.services_tree.column('Date', width=120, anchor='center')
         self.services_tree.column('Odometer', width=100, anchor='center')
         self.services_tree.column('Description', width=250, anchor='center')
@@ -941,50 +1139,67 @@ class CarManagementApp:
         self.services_tree.column('Next Service', width=200, anchor='center')
         self.services_tree.pack(fill='both', expand=True)
 
-        for col in ('ID', 'Vehicle', 'Type', 'Date', 'Odometer', 'Description', 'Cost', 'Interval Miles', 'Interval Days', 'Next Service'):
+        for col in ('ID', 'Vehicle', 'Types', 'Date', 'Odometer', 'Description', 'Cost', 'Interval Miles', 'Interval Days', 'Next Service'):
             self.services_tree.heading(col, command=lambda c=col: self.sort_column(self.services_tree, c, 'services'))
 
         scrollbar = ttk.Scrollbar(tree_frame, orient='vertical', command=self.services_tree.yview, bootstyle=PRIMARY)
         self.services_tree.configure(yscroll=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
 
+        # Right frame for form and parts used
         right_frame = ttk.Frame(self.services_container, padding=10)
         right_frame.pack(side='right', fill='y', padx=5)
 
-        form_frame = ttk.LabelFrame(right_frame, text='Manage Service', bootstyle=INFO, padding=10)
-        form_frame.pack(fill='x', pady=5)
+        # Service Types frame
+        service_types_frame = ttk.LabelFrame(right_frame, text='Service Types', bootstyle=INFO, padding=10)
+        service_types_frame.pack(fill='both', expand=True, pady=5)
 
-        ttk.Label(form_frame, text='Vehicle:', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_vehicle_combo = ttk.Combobox(form_frame, state='readonly', bootstyle=SECONDARY)
+        # Scrollable canvas for checkboxes
+        self.service_types_canvas = ttk.Canvas(service_types_frame, height=1000, borderwidth=2, relief='groove')
+        self.service_types_canvas.pack(side='left', fill='both', expand=True, padx=(0, 5))
+        scrollbar = ttk.Scrollbar(service_types_frame, orient='vertical', command=self.service_types_canvas.yview, bootstyle=PRIMARY)
+        scrollbar.pack(side='right', fill='y')
+        self.service_types_canvas.configure(yscrollcommand=scrollbar.set)
+        self.service_types_frame = ttk.Frame(self.service_types_canvas, padding=5)
+        self.service_types_canvas.create_window((0, 0), window=self.service_types_frame, anchor='nw')
+        self.service_types_frame.bind(
+            "<Configure>",
+            lambda e: self.service_types_canvas.configure(scrollregion=self.service_types_canvas.bbox("all"))
+        )
+        self.service_type_vars = {}
+        self.service_type_list_map = {}
+
+        # Form frame for service details
+        form_frame = ttk.LabelFrame(right_frame, text='Manage Service', bootstyle=INFO, padding=10)
+        form_frame.pack(fill='both', expand=True, pady=5)
+
+        ttk.Label(form_frame, text='Vehicle:', font=('Helvetica', 12)).pack(anchor='w', pady=2)
+        self.service_vehicle_combo = ttk.Combobox(form_frame, state='readonly', bootstyle=SECONDARY, font=('Helvetica', 12))
         self.service_vehicle_combo.pack(fill='x', pady=2)
 
-        ttk.Label(form_frame, text='Service Type:', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_type_combo = ttk.Combobox(form_frame, state='readonly', bootstyle=SECONDARY)
-        self.service_type_combo.pack(fill='x', pady=2)
-
-        ttk.Label(form_frame, text='Date (DD/MM/YYYY):', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_date_entry = ttk.Entry(form_frame, bootstyle=SECONDARY)
+        ttk.Label(form_frame, text='Date (DD/MM/YYYY):', font=('Helvetica', 12)).pack(anchor='w', pady=2)
+        self.service_date_entry = ttk.Entry(form_frame, bootstyle=SECONDARY, font=('Helvetica', 12))
         self.service_date_entry.pack(fill='x', pady=2)
         self.service_date_entry.insert(0, datetime.now().strftime('%d/%m/%Y'))
 
-        ttk.Label(form_frame, text='Odometer:', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_odometer_entry = ttk.Entry(form_frame, bootstyle=SECONDARY)
+        ttk.Label(form_frame, text='Odometer:', font=('Helvetica', 12)).pack(anchor='w', pady=2)
+        self.service_odometer_entry = ttk.Entry(form_frame, bootstyle=SECONDARY, font=('Helvetica', 12))
         self.service_odometer_entry.pack(fill='x', pady=2)
 
-        ttk.Label(form_frame, text='Service Interval Miles:', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_interval_miles_entry = ttk.Entry(form_frame, bootstyle=SECONDARY)
+        ttk.Label(form_frame, text='Service Interval Miles:', font=('Helvetica', 12)).pack(anchor='w', pady=2)
+        self.service_interval_miles_entry = ttk.Entry(form_frame, bootstyle=SECONDARY, font=('Helvetica', 12))
         self.service_interval_miles_entry.pack(fill='x', pady=2)
 
-        ttk.Label(form_frame, text='Service Interval Days:', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_interval_days_entry = ttk.Entry(form_frame, bootstyle=SECONDARY)
+        ttk.Label(form_frame, text='Service Interval Days:', font=('Helvetica', 12)).pack(anchor='w', pady=2)
+        self.service_interval_days_entry = ttk.Entry(form_frame, bootstyle=SECONDARY, font=('Helvetica', 12))
         self.service_interval_days_entry.pack(fill='x', pady=2)
 
-        ttk.Label(form_frame, text='Description:', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_desc_entry = ttk.Entry(form_frame, bootstyle=SECONDARY)
+        ttk.Label(form_frame, text='Description:', font=('Helvetica', 12)).pack(anchor='w', pady=2)
+        self.service_desc_entry = Text(form_frame, height=4, width=30, font=('Helvetica', 12))
         self.service_desc_entry.pack(fill='x', pady=2)
 
-        ttk.Label(form_frame, text='Cost ($):', font=('Helvetica', 10)).pack(anchor='w', pady=2)
-        self.service_cost_entry = ttk.Entry(form_frame, bootstyle=SECONDARY)
+        ttk.Label(form_frame, text='Cost ($):', font=('Helvetica', 12)).pack(anchor='w', pady=2)
+        self.service_cost_entry = ttk.Entry(form_frame, bootstyle=SECONDARY, font=('Helvetica', 12))
         self.service_cost_entry.pack(fill='x', pady=2)
 
         button_frame = ttk.Frame(form_frame)
@@ -994,20 +1209,21 @@ class CarManagementApp:
         ttk.Button(button_frame, text='Update Service', command=self.update_service, bootstyle=WARNING).pack(side='left', fill='x', expand=True, padx=2)
         ttk.Button(button_frame, text='Delete Service', command=self.delete_service, bootstyle=DANGER).pack(side='left', fill='x', expand=True, padx=2)
 
+        # Parts used frame
         parts_used_frame = ttk.LabelFrame(right_frame, text='Parts Used in Service', bootstyle=INFO, padding=10)
-        parts_used_frame.pack(fill='both', expand=True, pady=10)
+        parts_used_frame.pack(fill='both', pady=10)
 
-        self.service_parts_tree = ttk.Treeview(parts_used_frame, columns=('ID', 'Name', 'Manufacturer', 'Part Number', 'Quantity Used'), show='headings', bootstyle='primary')
+        self.service_parts_tree = ttk.Treeview(parts_used_frame, columns=('ID', 'Name', 'Manufacturer', 'Part Number', 'Quantity Used'), show='headings', bootstyle='primary', height=25)
         self.service_parts_tree.heading('ID', text='ID', anchor='center')
         self.service_parts_tree.heading('Name', text='Name', anchor='center')
         self.service_parts_tree.heading('Manufacturer', text='Manufacturer', anchor='center')
         self.service_parts_tree.heading('Part Number', text='Part Number', anchor='center')
         self.service_parts_tree.heading('Quantity Used', text='Qty Used', anchor='center')
-        self.service_parts_tree.column('ID', width=60, anchor='center')
-        self.service_parts_tree.column('Name', width=200, anchor='center')
-        self.service_parts_tree.column('Manufacturer', width=150, anchor='center')
-        self.service_parts_tree.column('Part Number', width=120, anchor='center')
-        self.service_parts_tree.column('Quantity Used', width=80, anchor='center')
+        self.service_parts_tree.column('ID', width=50, anchor='center')
+        self.service_parts_tree.column('Name', width=150, anchor='center')
+        self.service_parts_tree.column('Manufacturer', width=100, anchor='center')
+        self.service_parts_tree.column('Part Number', width=100, anchor='center')
+        self.service_parts_tree.column('Quantity Used', width=60, anchor='center')
         self.service_parts_tree.pack(fill='both', expand=True)
 
         for col in ('ID', 'Name', 'Manufacturer', 'Part Number', 'Quantity Used'):
@@ -1016,20 +1232,20 @@ class CarManagementApp:
         add_part_frame = ttk.Frame(parts_used_frame)
         add_part_frame.pack(fill='x', pady=5)
 
-        ttk.Label(add_part_frame, text='Select Part:', font=('Helvetica', 10)).pack(side='left', padx=5)
-        self.part_combo = ttk.Combobox(add_part_frame, state='readonly', bootstyle=SECONDARY)
+        ttk.Label(add_part_frame, text='Select Part:', font=('Helvetica', 9)).pack(side='left', padx=5)
+        self.part_combo = ttk.Combobox(add_part_frame, state='readonly', bootstyle=SECONDARY, font=('Helvetica', 9))
         self.part_combo.pack(side='left', fill='x', expand=True, padx=5)
         self.load_part_combo()
 
-        ttk.Label(add_part_frame, text='Qty:', font=('Helvetica', 10)).pack(side='left', padx=5)
-        self.part_qty_used_entry = ttk.Entry(add_part_frame, width=5, bootstyle=SECONDARY)
+        ttk.Label(add_part_frame, text='Qty:', font=('Helvetica', 9)).pack(side='left', padx=5)
+        self.part_qty_used_entry = ttk.Entry(add_part_frame, width=5, bootstyle=SECONDARY, font=('Helvetica', 9))
         self.part_qty_used_entry.pack(side='left', padx=5)
 
         ttk.Button(add_part_frame, text='Add Part', command=self.add_part_to_service, bootstyle=SUCCESS).pack(side='left', padx=5)
         ttk.Button(add_part_frame, text='Remove Part', command=self.remove_part_from_service, bootstyle=DANGER).pack(side='left', padx=5)
 
         self.load_vehicle_combo()
-        self.load_service_type_combo()
+        self.load_service_types_checkboxes()
         self.load_services()
         self.services_tree.bind('<<TreeviewSelect>>', self.select_service)
 
@@ -1038,18 +1254,35 @@ class CarManagementApp:
         cursor.execute('SELECT id, name, year, model FROM vehicles ORDER BY id ASC')
         vehicles = [(f"{row[0]} - {row[1]}{f' ({row[2]} {row[3]})' if row[2] and row[3] else ''}", row[0]) for row in cursor.fetchall()]
         self.vehicle_id_map = {v[0]: v[1] for v in vehicles}
+        self.id_to_display_map = {v[1]: v[0] for v in vehicles}
         if hasattr(self, 'service_vehicle_combo'):
             self.service_vehicle_combo['values'] = [v[0] for v in vehicles]
         if hasattr(self, 'part_vehicle_combo'):
             self.part_vehicle_combo['values'] = [v[0] for v in vehicles]
 
-    def load_service_type_combo(self):
+    def load_service_types_checkboxes(self):
+        # Clear existing checkboxes
+        for widget in self.service_types_frame.winfo_children():
+            widget.destroy()
+        self.service_type_vars = {}
+        self.service_type_list_map = {}
         cursor = self.conn.cursor()
         cursor.execute('SELECT id, name FROM service_types ORDER BY id ASC')
-        service_types = [(f"{row[0]} - {row[1]}", row[0]) for row in cursor.fetchall()]
-        self.service_type_id_map = {st[0]: st[1] for st in service_types}
-        if hasattr(self, 'service_type_combo'):
-            self.service_type_combo['values'] = [st[0] for st in service_types]
+        for row in cursor.fetchall():
+            service_type_id, name = row
+            display = f"{service_type_id} - {name}"
+            var = ttk.BooleanVar(value=False)
+            self.service_type_vars[service_type_id] = var
+            self.service_type_list_map[display] = service_type_id
+            chk = ttk.Checkbutton(
+                self.service_types_frame,
+                text=display,
+                variable=var,
+                bootstyle=PRIMARY,
+                padding=(10, 5),
+                style='TCheckbutton'
+            )
+            chk.pack(anchor='w', padx=10, pady=3, fill='x')
 
     def load_part_combo(self, vehicle_id=None):
         cursor = self.conn.cursor()
@@ -1087,21 +1320,30 @@ class CarManagementApp:
         vehicle_id = None
         if selected_vehicle:
             vehicle_id = self.vehicles_tree.item(selected_vehicle, 'values')[0]
-        query = '''
-            SELECT s.id, COALESCE(v.name || (CASE WHEN v.model IS NOT NULL THEN ' (' || v.model || ')' ELSE '' END), v.name), st.name, s.date, s.odometer, s.description, s.cost, s.service_interval_miles, s.service_interval_days
+        query_base = '''
+            SELECT s.id, COALESCE(v.name || (CASE WHEN v.model IS NOT NULL THEN ' (' || v.model || ')' ELSE '' END), v.name) AS vehicle_display, 
+                   GROUP_CONCAT(st.name, ', ') AS service_types, s.date, s.odometer, s.description, s.cost, s.service_interval_miles, s.service_interval_days
             FROM services s
             JOIN vehicles v ON s.vehicle_id = v.id
-            LEFT JOIN service_types st ON s.service_type_id = st.id
+            LEFT JOIN service_service_types sst ON s.id = sst.service_id
+            LEFT JOIN service_types st ON sst.service_type_id = st.id
+            {where_clause}
+            GROUP BY s.id
+            {having_clause}
+            ORDER BY s.id ASC
         '''
+        where_clause = ''
+        having_clause = ''
         params = []
         if vehicle_id:
-            query += ' WHERE s.vehicle_id = ?'
+            where_clause = 'WHERE s.vehicle_id = ?'
             params = [vehicle_id]
-        query += ' ORDER BY s.id ASC'
+        query = query_base.format(where_clause=where_clause, having_clause=having_clause)
         cursor.execute(query, params)
         current_date = datetime.now()
         for row in cursor.fetchall():
-            service_id, vehicle_name, service_type, date, odometer, description, cost, interval_miles, interval_days = row
+            row = tuple('' if x is None else x for x in row)
+            service_id, vehicle_name, service_types, date, odometer, description, cost, interval_miles, interval_days = row
             next_service = self.calculate_next_service(date, odometer, interval_miles, interval_days)
             is_overdue = False
             if interval_days or interval_miles:
@@ -1125,13 +1367,13 @@ class CarManagementApp:
                         continue
                     if interval_days and (current_date - last_date).days > interval_days:
                         is_overdue = True
-                    if interval_miles and last_odometer and odometer and (odometer - last_odometer) > interval_miles:
+                    if interval_miles and last_odometer and odometer and (int(odometer) - int(last_odometer)) > interval_miles:
                         is_overdue = True
                 else:
                     if interval_days and (current_date - service_date).days > interval_days:
                         is_overdue = True
             tag = 'overdue' if is_overdue else ''
-            self.services_tree.insert('', 'end', values=(service_id, vehicle_name, service_type, date, odometer, description, cost, interval_miles, interval_days, next_service), tags=(tag,))
+            self.services_tree.insert('', 'end', values=(service_id, vehicle_name, service_types, date, odometer, description, cost, interval_miles, interval_days, next_service), tags=(tag,))
         self.services_tree.tag_configure('overdue', background='#ffcccc')
 
     def calculate_next_service(self, date, odometer, interval_miles, interval_days):
@@ -1143,7 +1385,7 @@ class CarManagementApp:
                     next_date = service_date + timedelta(days=interval_days)
                     next_service.append(f"Date: {next_date.strftime('%d/%m/%Y')}")
                 if interval_miles and odometer:
-                    next_odometer = odometer + interval_miles
+                    next_odometer = int(odometer) + interval_miles
                     next_service.append(f"Miles: {next_odometer}")
             except ValueError:
                 return ''
@@ -1158,22 +1400,38 @@ class CarManagementApp:
         vehicle_id = None
         if selected_vehicle:
             vehicle_id = self.vehicles_tree.item(selected_vehicle, 'values')[0]
-        query = '''
-            SELECT s.id, COALESCE(v.name || (CASE WHEN v.model IS NOT NULL THEN ' (' || v.model || ')' ELSE '' END), v.name), st.name, s.date, s.odometer, s.description, s.cost, s.service_interval_miles, s.service_interval_days
+        query_base = '''
+            SELECT s.id, COALESCE(v.name || (CASE WHEN v.model IS NOT NULL THEN ' (' || v.model || ')' ELSE '' END), v.name) AS vehicle_display, 
+                   GROUP_CONCAT(st.name, ', ') AS service_types, s.date, s.odometer, s.description, s.cost, s.service_interval_miles, s.service_interval_days
             FROM services s
             JOIN vehicles v ON s.vehicle_id = v.id
-            LEFT JOIN service_types st ON s.service_type_id = st.id
-            WHERE (lower(st.name) LIKE ? OR lower(v.name) LIKE ? OR lower(v.model) LIKE ?)
+            LEFT JOIN service_service_types sst ON s.id = sst.service_id
+            LEFT JOIN service_types st ON sst.service_type_id = st.id
+            {where_clause}
+            GROUP BY s.id
+            {having_clause}
+            ORDER BY s.id ASC
         '''
-        params = [f'%{search_term}%', f'%{search_term}%', f'%{search_term}%']
+        where_clause = ''
+        having_clause = ''
+        params = []
+        if search_term:
+            where_clause = 'WHERE (lower(v.name) LIKE ? OR lower(v.model) LIKE ? OR lower(s.description) LIKE ?)'
+            params += [f'%{search_term}%', f'%{search_term}%', f'%{search_term}%']
+            having_clause = 'HAVING lower(service_types) LIKE ?'
+            params.append(f'%{search_term}%')
         if vehicle_id:
-            query += ' AND s.vehicle_id = ?'
+            if where_clause:
+                where_clause += ' AND s.vehicle_id = ?'
+            else:
+                where_clause = 'WHERE s.vehicle_id = ?'
             params.append(vehicle_id)
-        query += ' ORDER BY s.id ASC'
+        query = query_base.format(where_clause=where_clause, having_clause=having_clause)
         cursor.execute(query, params)
         current_date = datetime.now()
         for row in cursor.fetchall():
-            service_id, vehicle_name, service_type, date, odometer, description, cost, interval_miles, interval_days = row
+            row = tuple('' if x is None else x for x in row)
+            service_id, vehicle_name, service_types, date, odometer, description, cost, interval_miles, interval_days = row
             next_service = self.calculate_next_service(date, odometer, interval_miles, interval_days)
             is_overdue = False
             if interval_days or interval_miles:
@@ -1197,13 +1455,13 @@ class CarManagementApp:
                         continue
                     if interval_days and (current_date - last_date).days > interval_days:
                         is_overdue = True
-                    if interval_miles and last_odometer and odometer and (odometer - last_odometer) > interval_miles:
+                    if interval_miles and last_odometer and odometer and (int(odometer) - int(last_odometer)) > interval_miles:
                         is_overdue = True
                 else:
                     if interval_days and (current_date - service_date).days > interval_days:
                         is_overdue = True
             tag = 'overdue' if is_overdue else ''
-            self.services_tree.insert('', 'end', values=(service_id, vehicle_name, service_type, date, odometer, description, cost, interval_miles, interval_days, next_service), tags=(tag,))
+            self.services_tree.insert('', 'end', values=(service_id, vehicle_name, service_types, date, odometer, description, cost, interval_miles, interval_days, next_service), tags=(tag,))
         self.services_tree.tag_configure('overdue', background='#ffcccc')
 
     def export_services(self):
@@ -1212,14 +1470,17 @@ class CarManagementApp:
             return
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT s.id, COALESCE(v.name || (CASE WHEN v.model IS NOT NULL THEN ' (' || v.model || ')' ELSE '' END), v.name), st.name, s.date, s.odometer, s.description, s.cost, s.service_interval_miles, s.service_interval_days
+            SELECT s.id, COALESCE(v.name || (CASE WHEN v.model IS NOT NULL THEN ' (' || v.model || ')' ELSE '' END), v.name) AS vehicle_display, 
+                   GROUP_CONCAT(st.name, ', ') AS service_types, s.date, s.odometer, s.description, s.cost, s.service_interval_miles, s.service_interval_days
             FROM services s
             JOIN vehicles v ON s.vehicle_id = v.id
-            LEFT JOIN service_types st ON s.service_type_id = st.id
+            LEFT JOIN service_service_types sst ON s.id = sst.service_id
+            LEFT JOIN service_types st ON sst.service_type_id = st.id
+            GROUP BY s.id
         ''')
         with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(['ID', 'Vehicle', 'Type', 'Date', 'Odometer', 'Description', 'Cost', 'Interval Miles', 'Interval Days'])
+            writer.writerow(['ID', 'Vehicle', 'Types', 'Date', 'Odometer', 'Description', 'Cost', 'Interval Miles', 'Interval Days'])
             for row in cursor.fetchall():
                 writer.writerow(row)
         messagebox.showinfo('Export Successful', 'Services exported to CSV successfully')
@@ -1230,8 +1491,7 @@ class CarManagementApp:
             messagebox.showerror('Error', 'Select a vehicle')
             return
         vehicle_id = self.vehicle_id_map.get(vehicle_selection)
-        service_type_selection = self.service_type_combo.get()
-        service_type_id = self.service_type_id_map.get(service_type_selection) if service_type_selection else None
+        selected_types = [tid for tid, var in self.service_type_vars.items() if var.get()]
         date = self.service_date_entry.get()
         if not self.validate_date(date):
             messagebox.showerror('Error', 'Date must be in DD/MM/YYYY format (e.g., 31/12/2025)')
@@ -1239,7 +1499,7 @@ class CarManagementApp:
         odometer = self.service_odometer_entry.get()
         interval_miles = self.service_interval_miles_entry.get()
         interval_days = self.service_interval_days_entry.get()
-        description = self.service_desc_entry.get()
+        description = self.service_desc_entry.get('1.0', END).strip()
         cost = self.service_cost_entry.get()
         if not vehicle_id or not date:
             messagebox.showerror('Error', 'Vehicle and Date are required')
@@ -1273,8 +1533,11 @@ class CarManagementApp:
                 messagebox.showerror('Error', 'Cost must be an integer if provided')
                 return
         cursor = self.conn.cursor()
-        cursor.execute('INSERT INTO services (vehicle_id, service_type_id, date, odometer, description, cost, service_interval_miles, service_interval_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                       (vehicle_id, service_type_id, date, odometer_value, description or None, cost_value, interval_miles_value, interval_days_value))
+        cursor.execute('INSERT INTO services (vehicle_id, date, odometer, description, cost, service_interval_miles, service_interval_days) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                       (vehicle_id, date, odometer_value, description or None, cost_value, interval_miles_value, interval_days_value))
+        service_id = cursor.lastrowid
+        for type_id in selected_types:
+            cursor.execute('INSERT INTO service_service_types (service_id, service_type_id) VALUES (?, ?)', (service_id, type_id))
         self.conn.commit()
         self.load_services()
         self.clear_service_entries()
@@ -1285,17 +1548,16 @@ class CarManagementApp:
         if selected:
             values = self.services_tree.item(selected, 'values')
             cursor = self.conn.cursor()
-            cursor.execute('SELECT vehicle_id, service_type_id FROM services WHERE id = ?', (values[0],))
-            vehicle_id, service_type_id = cursor.fetchone()
+            cursor.execute('SELECT vehicle_id FROM services WHERE id = ?', (values[0],))
+            vehicle_id = cursor.fetchone()[0]
             cursor.execute('SELECT name, year, model FROM vehicles WHERE id = ?', (vehicle_id,))
             vehicle = cursor.fetchone()
             vehicle_display = f"{vehicle_id} - {vehicle[0]}{f' ({vehicle[1]} {vehicle[2]})' if vehicle[1] and vehicle[2] else ''}"
             self.service_vehicle_combo.set(vehicle_display)
-            self.service_type_combo.set('')
-            if service_type_id:
-                cursor.execute('SELECT name FROM service_types WHERE id = ?', (service_type_id,))
-                service_type_name = cursor.fetchone()[0]
-                self.service_type_combo.set(f"{service_type_id} - {service_type_name}")
+            cursor.execute('SELECT service_type_id FROM service_service_types WHERE service_id = ?', (values[0],))
+            selected_ids = [row[0] for row in cursor.fetchall()]
+            for tid, var in self.service_type_vars.items():
+                var.set(tid in selected_ids)
             self.service_date_entry.delete(0, ttk.END)
             self.service_date_entry.insert(0, values[3])
             self.service_odometer_entry.delete(0, ttk.END)
@@ -1304,8 +1566,8 @@ class CarManagementApp:
             self.service_interval_miles_entry.insert(0, values[7] if values[7] else '')
             self.service_interval_days_entry.delete(0, ttk.END)
             self.service_interval_days_entry.insert(0, values[8] if values[8] else '')
-            self.service_desc_entry.delete(0, ttk.END)
-            self.service_desc_entry.insert(0, values[5] if values[5] else '')
+            self.service_desc_entry.delete('1.0', END)
+            self.service_desc_entry.insert('1.0', values[5] if values[5] else '')
             self.service_cost_entry.delete(0, ttk.END)
             self.service_cost_entry.insert(0, values[6] if values[6] else '')
             self.load_service_parts(values[0])
@@ -1318,7 +1580,7 @@ class CarManagementApp:
             self.service_parts_tree.delete(item)
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT COALESCE(sp.alt_part_id, p.id) AS part_id, p.name, 
+            SELECT COALESCE(sp.alt_part_id, sp.part_id) AS part_id, p.name, 
                    COALESCE(ap.manufacturer, p.manufacturer) AS manufacturer, 
                    COALESCE(ap.part_number, p.part_number) AS part_number, 
                    sp.quantity_used
@@ -1329,7 +1591,8 @@ class CarManagementApp:
             ORDER BY sp.part_id ASC, sp.alt_part_id ASC
         ''', (service_id,))
         for row in cursor.fetchall():
-            self.service_parts_tree.insert('', 'end', values=row)
+            values = tuple('' if x is None else x for x in row)
+            self.service_parts_tree.insert('', 'end', values=values)
 
     def add_part_to_service(self):
         selected_service = self.services_tree.focus()
@@ -1402,8 +1665,7 @@ class CarManagementApp:
             messagebox.showerror('Error', 'Select a vehicle')
             return
         vehicle_id = self.vehicle_id_map.get(vehicle_selection)
-        service_type_selection = self.service_type_combo.get()
-        service_type_id = self.service_type_id_map.get(service_type_selection) if service_type_selection else None
+        selected_types = [tid for tid, var in self.service_type_vars.items() if var.get()]
         date = self.service_date_entry.get()
         if not self.validate_date(date):
             messagebox.showerror('Error', 'Date must be in DD/MM/YYYY format (e.g., 31/12/2025)')
@@ -1411,7 +1673,7 @@ class CarManagementApp:
         odometer = self.service_odometer_entry.get()
         interval_miles = self.service_interval_miles_entry.get()
         interval_days = self.service_interval_days_entry.get()
-        description = self.service_desc_entry.get()
+        description = self.service_desc_entry.get('1.0', END).strip()
         cost = self.service_cost_entry.get()
         if not vehicle_id or not date:
             messagebox.showerror('Error', 'Vehicle and Date are required')
@@ -1445,8 +1707,11 @@ class CarManagementApp:
                 messagebox.showerror('Error', 'Cost must be an integer if provided')
                 return
         cursor = self.conn.cursor()
-        cursor.execute('UPDATE services SET vehicle_id=?, service_type_id=?, date=?, odometer=?, description=?, cost=?, service_interval_miles=?, service_interval_days=? WHERE id=?',
-                       (vehicle_id, service_type_id, date, odometer_value, description or None, cost_value, interval_miles_value, interval_days_value, id_))
+        cursor.execute('UPDATE services SET vehicle_id=?, date=?, odometer=?, description=?, cost=?, service_interval_miles=?, service_interval_days=? WHERE id=?',
+                       (vehicle_id, date, odometer_value, description or None, cost_value, interval_miles_value, interval_days_value, id_))
+        cursor.execute('DELETE FROM service_service_types WHERE service_id=?', (id_,))
+        for type_id in selected_types:
+            cursor.execute('INSERT INTO service_service_types (service_id, service_type_id) VALUES (?, ?)', (id_, type_id))
         self.conn.commit()
         self.load_services()
         self.clear_service_entries()
@@ -1460,6 +1725,7 @@ class CarManagementApp:
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM services WHERE id=?', (id_,))
         cursor.execute('DELETE FROM service_parts WHERE service_id=?', (id_,))
+        cursor.execute('DELETE FROM service_service_types WHERE service_id=?', (id_,))
         self.conn.commit()
         self.load_services()
         self.clear_service_entries()
@@ -1468,14 +1734,14 @@ class CarManagementApp:
     def clear_service_entries(self):
         if hasattr(self, 'service_vehicle_combo'):
             self.service_vehicle_combo.set('')
-        if hasattr(self, 'service_type_combo'):
-            self.service_type_combo.set('')
+        for var in self.service_type_vars.values():
+            var.set(False)
         self.service_date_entry.delete(0, ttk.END)
         self.service_date_entry.insert(0, datetime.now().strftime('%d/%m/%Y'))
         self.service_odometer_entry.delete(0, ttk.END)
         self.service_interval_miles_entry.delete(0, ttk.END)
         self.service_interval_days_entry.delete(0, ttk.END)
-        self.service_desc_entry.delete(0, ttk.END)
+        self.service_desc_entry.delete('1.0', END)
         self.service_cost_entry.delete(0, ttk.END)
         self.clear_service_parts_tree()
         self.load_part_combo()

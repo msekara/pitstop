@@ -1,6 +1,6 @@
 Name:           pitstop
 Version:        1.0.0
-Release:        3%{?dist}
+Release:        5%{?dist}
 Summary:        Car Parts and Service Management Application
 License:        MIT
 Group:          Applications/Productivity
@@ -59,6 +59,10 @@ update-desktop-database &>/dev/null || :
 update-desktop-database &>/dev/null || :
 
 %changelog
+* Fri Aug 29 2025 Mladen Sekara <mladen.sekara@msprimes.com> - 1.0.0-5
+- Service types now checkboxes. Fixed issue where selected service types get de-selected when other values are modified.
+* Fri Aug 29 2025 Mladen Sekara <mladen.sekara@msprimes.com> - 1.0.0-4
+- Parts inventory now lists alternative parts. Minor cosmetic changes.
 * Sun Aug 24 2025 Mladen Sekara <mladen.sekara@msprimes.com> - 1.0.0-3
 - Moved database to user homedir
 * Sun Aug 24 2025 Mladen Sekara <mladen.sekara@msprimes.com> - 1.0.0-2
